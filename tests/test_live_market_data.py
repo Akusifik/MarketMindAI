@@ -111,8 +111,13 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(.005); self.assertFalse(task.done())
         await socket.push({"success": False, "ret_msg": "denied", "op": "subscribe", "req_id": request["req_id"]})
         with self.assertRaises(ConnectionError): await task
-        with self.assertRaises(asyncio.TimeoutError): await provider.subscribe_trades("BTCUSDT")
+        self.assertFalse(provider.health.connected)
         await provider.disconnect(); self.assertFalse(provider._pending)
+        timeout_socket = FakeSocket(auto_ack=False)
+        timeout_provider = BybitWebSocketProvider("test", websocket_factory=lambda _: asyncio.sleep(0, result=timeout_socket), ack_timeout=.03, heartbeat_interval=100)
+        await timeout_provider.connect()
+        with self.assertRaises(asyncio.TimeoutError): await timeout_provider.subscribe_trades("BTCUSDT")
+        await timeout_provider.disconnect()
 
     async def test_delayed_ack_and_cancelled_ack_wait(self):
         await self.provider.disconnect(); socket = FakeSocket(auto_ack=False)
@@ -126,6 +131,95 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         cancelled.cancel()
         with self.assertRaises(asyncio.CancelledError): await cancelled
         self.assertFalse(provider._pending)
+        await provider.disconnect()
+
+    async def test_snapshot_before_ack_is_provisional_then_published_on_success(self):
+        await self.provider.disconnect(); socket = FakeSocket(auto_ack=False)
+        provider = BybitWebSocketProvider("test", websocket_factory=lambda _: asyncio.sleep(0, result=socket), ack_timeout=.1, heartbeat_interval=100)
+        await provider.connect()
+        subscribing = asyncio.create_task(provider.subscribe_order_book("BTCUSDT"))
+        await asyncio.sleep(0)
+        request = socket.sent[-1]
+        await socket.push(book())
+        await asyncio.sleep(.01)
+        health = provider.health.symbols["BTCUSDT"]
+        self.assertTrue(health.synchronized)
+        self.assertNotIn("BTCUSDT", provider._ready_books)
+        with self.assertRaises(asyncio.TimeoutError): await asyncio.wait_for(provider.next_event(), .01)
+        await socket.push({"success": True, "op": "subscribe", "req_id": request["req_id"]})
+        await subscribing; await asyncio.sleep(.01)
+        self.assertIn("BTCUSDT", provider._ready_books)
+        self.assertTrue(health.synchronized)
+        self.assertEqual((health.last_update_id, health.last_sequence), (18521288, 7961638724))
+        self.assertIsInstance(await asyncio.wait_for(provider.next_event(), .1), OrderBookSnapshot)
+        await provider.disconnect()
+
+    async def test_early_snapshot_failed_ack_invalidates_and_fails_session(self):
+        await self.provider.disconnect(); socket = FakeSocket(auto_ack=False)
+        provider = BybitWebSocketProvider("test", websocket_factory=lambda _: asyncio.sleep(0, result=socket), ack_timeout=.1, heartbeat_interval=100)
+        await provider.connect()
+        subscribing = asyncio.create_task(provider.subscribe_order_book("BTCUSDT")); await asyncio.sleep(0)
+        request = socket.sent[-1]
+        await socket.push(book()); await asyncio.sleep(.01)
+        self.assertTrue(provider.health.symbols["BTCUSDT"].synchronized)
+        await socket.push({"success": False, "ret_msg": "denied", "op": "subscribe", "req_id": request["req_id"]})
+        with self.assertRaises(ConnectionError): await subscribing
+        self.assertFalse(provider.health.connected)
+        self.assertFalse(provider.health.symbols["BTCUSDT"].synchronized)
+        self.assertNotIn("BTCUSDT", provider._ready_books)
+        await provider.disconnect()
+
+    async def test_delta_before_snapshot_and_unsolicited_snapshot_are_rejected(self):
+        await self.provider.disconnect(); socket = FakeSocket(auto_ack=False)
+        provider = BybitWebSocketProvider("test", websocket_factory=lambda _: asyncio.sleep(0, result=socket), ack_timeout=.1, heartbeat_interval=100)
+        await provider.connect()
+        subscribing = asyncio.create_task(provider.subscribe_order_book("BTCUSDT")); await asyncio.sleep(0)
+        await socket.push(book(kind="delta", u=18521289, seq=7961638725, bids=[["100", "4"]], asks=[]))
+        await asyncio.sleep(.01)
+        self.assertFalse(provider.health.symbols["BTCUSDT"].synchronized)
+        subscribing.cancel(); await asyncio.gather(subscribing, return_exceptions=True)
+        await socket.push(book("ETHUSDT", u=50, seq=80, bids=[["200", "1"]], asks=[["201", "1"]]))
+        await asyncio.sleep(.01)
+        self.assertFalse(provider.health.symbols["ETHUSDT"].synchronized)
+        await provider.disconnect()
+
+    async def test_mismatched_and_old_session_ack_cannot_create_readiness(self):
+        await self.provider.disconnect(); first, second = FakeSocket(auto_ack=False), FakeSocket(auto_ack=False)
+        sockets = [first, second]
+        async def factory(_): return sockets.pop(0)
+        provider = BybitWebSocketProvider("test", websocket_factory=factory, ack_timeout=.1, heartbeat_interval=100)
+        await provider.connect()
+        subscribing = asyncio.create_task(provider.subscribe_order_book("BTCUSDT")); await asyncio.sleep(0)
+        old_request = first.sent[-1]
+        await first.push({"success": True, "op": "subscribe", "req_id": "mismatch"})
+        await asyncio.sleep(.01)
+        self.assertNotIn("BTCUSDT", provider._ready_books)
+        subscribing.cancel(); await asyncio.gather(subscribing, return_exceptions=True)
+        await provider.disconnect(); await provider.connect()
+        await second.push({"success": True, "op": "subscribe", "req_id": old_request["req_id"]})
+        await second.push(book())
+        await asyncio.sleep(.01)
+        self.assertNotIn("BTCUSDT", provider._ready_books)
+        self.assertFalse(provider.health.symbols["BTCUSDT"].synchronized)
+        await provider.disconnect()
+
+    async def test_multisymbol_ack_snapshot_interleaving(self):
+        await self.provider.disconnect(); socket = FakeSocket(auto_ack=False)
+        provider = BybitWebSocketProvider("test", websocket_factory=lambda _: asyncio.sleep(0, result=socket), ack_timeout=.1, heartbeat_interval=100)
+        await provider.connect()
+        btc = asyncio.create_task(provider.subscribe_order_book("BTCUSDT")); await asyncio.sleep(0)
+        btc_request = socket.sent[-1]
+        await socket.push(book("BTCUSDT"))
+        await socket.push({"success": True, "op": "subscribe", "req_id": btc_request["req_id"]})
+        eth = asyncio.create_task(provider.subscribe_order_book("ETHUSDT"))
+        await btc; await asyncio.sleep(0)
+        eth_request = socket.sent[-1]
+        await socket.push({"success": True, "op": "subscribe", "req_id": eth_request["req_id"]})
+        await socket.push(book("ETHUSDT", u=50, seq=80, bids=[["200", "1"]], asks=[["201", "1"]]))
+        await eth; await asyncio.sleep(.01)
+        self.assertTrue(provider.health.symbols["BTCUSDT"].synchronized)
+        self.assertTrue(provider.health.symbols["ETHUSDT"].synchronized)
+        self.assertEqual(provider.health.symbols["ETHUSDT"].last_sequence, 80)
         await provider.disconnect()
 
     async def test_heartbeat_success_and_quiet_timeout(self):

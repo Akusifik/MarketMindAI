@@ -263,6 +263,30 @@ class BybitWebSocketProvider(LiveMarketDataProvider):
                     future, operation, topics, _ = pending
                     if payload.get("op") == "ping" and payload.get("success") is True:
                         self.health.last_pong_time = now
+                    if payload.get("success") is True and payload.get("op") == operation:
+                        # Transition readiness in the reader before receiving the
+                        # next frame. Bybit can send the initial snapshot directly
+                        # after the subscribe ACK, before the awaiting requester is
+                        # scheduled again.
+                        for topic in topics:
+                            if not topic.startswith("orderbook."):
+                                continue
+                            symbol = topic.rsplit(".", 1)[-1]
+                            if operation == "subscribe":
+                                was_ready = symbol in self._ready_books
+                                self._subscription_states[topic] = SubscriptionState.SUBSCRIBED
+                                self._ready_books.add(symbol)
+                                book = self._books.get(symbol)
+                                if not was_ready and book and book.health.synchronized and book.state is not None:
+                                    self._queue.put_nowait((session, symbol, book.health.generation, book.state.snapshot()))
+                            elif operation == "unsubscribe":
+                                self._ready_books.discard(symbol)
+                    elif operation == "subscribe" and payload.get("op") == operation:
+                        affected = [topic.rsplit(".", 1)[-1] for topic in topics if topic.startswith("orderbook.")]
+                        for symbol in affected:
+                            self._ready_books.discard(symbol)
+                            self._ensure_book(symbol).invalidate()
+                        self._fail_session(ConnectionError(f"Bybit subscribe failed: {payload.get('ret_msg', '')}"), session)
                     if not future.done(): future.set_result(payload)
                     continue
                 if isinstance(payload, dict) and payload.get("op") == "ping" and payload.get("success") is True:
@@ -272,9 +296,17 @@ class BybitWebSocketProvider(LiveMarketDataProvider):
                     logger.warning("Malformed Bybit market-data message"); continue
                 for event in events:
                     if isinstance(event, BybitBookMessage):
-                        if event.symbol not in self._ready_books:
-                            continue
+                        topic = f"orderbook.{self.depth}.{event.symbol}"
+                        state = self._subscription_states.get(topic, SubscriptionState.UNSUBSCRIBED)
+                        pending_subscribe = any(
+                            pending_session == session and operation == "subscribe" and topic in topics
+                            for _, operation, topics, pending_session in self._pending.values()
+                        )
                         book = self._ensure_book(event.symbol)
+                        ready = event.symbol in self._ready_books
+                        provisional = pending_subscribe and state in {SubscriptionState.SUBSCRIBING, SubscriptionState.RESYNCING}
+                        if not ready and not (provisional and (event.kind == "snapshot" or book.health.synchronized)):
+                            continue
                         generation = book.health.generation
                         snapshot, status = book.apply(event, generation)
                         if status in {"gap", "restart"}:
@@ -282,7 +314,7 @@ class BybitWebSocketProvider(LiveMarketDataProvider):
                                 task = asyncio.create_task(self._resync(event.symbol, session, already_invalid=True), name=f"bybit-resync-{event.symbol}")
                                 self._resync_tasks.add(task)
                                 task.add_done_callback(lambda done, active_session=session: self._resync_done(done, active_session))
-                        elif snapshot is not None:
+                        elif snapshot is not None and ready:
                             await self._queue.put((session, event.symbol, generation, snapshot))
                     else:
                         await self._queue.put((session, None, None, event))
@@ -325,7 +357,7 @@ class BybitWebSocketProvider(LiveMarketDataProvider):
             if session != self._session: continue
             if symbol is None: return event
             health = self.health.symbols.get(symbol)
-            if health and health.synchronized and health.generation == generation: return event
+            if symbol in self._ready_books and health and health.synchronized and health.generation == generation: return event
 
     async def events(self):
         while True: yield await self.next_event()
