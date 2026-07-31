@@ -1,0 +1,7 @@
+EXCHANGE = "bybit"
+
+SYMBOL = "BTC/USDT"
+
+TIMEFRAME = "1d"
+
+CANDLE_LIMIT = 200
