@@ -75,6 +75,34 @@ class OrderBookSnapshot:
 
 
 @dataclass(frozen=True)
+class OrderBookUpdate:
+    """Provider-neutral incremental order-book change."""
+
+    symbol: str
+    timestamp: datetime
+    bids: Sequence[OrderBookLevel]
+    asks: Sequence[OrderBookLevel]
+    sequence: int
+    previous_sequence: Optional[int] = None
+
+    def __post_init__(self):
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise ValueError("symbol must be a non-empty string.")
+        object.__setattr__(self, "timestamp", normalize_timestamp(self.timestamp))
+        bids, asks = tuple(self.bids), tuple(self.asks)
+        if any(not isinstance(level, OrderBookLevel) for level in bids + asks):
+            raise ValueError("Updates require normalized order-book levels.")
+        if not isinstance(self.sequence, int) or self.sequence < 0:
+            raise ValueError("sequence must be a non-negative integer.")
+        if self.previous_sequence is not None and (
+            not isinstance(self.previous_sequence, int) or self.previous_sequence < 0
+        ):
+            raise ValueError("previous_sequence must be a non-negative integer.")
+        object.__setattr__(self, "bids", bids)
+        object.__setattr__(self, "asks", asks)
+
+
+@dataclass(frozen=True)
 class Trade:
     """side is aggressor side: BUY lifts the ask, SELL hits the bid."""
 
