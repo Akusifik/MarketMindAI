@@ -1,14 +1,12 @@
-"""Read-only live Bybit order-flow analysis runner.
+"""Read-only live Bybit order-flow diagnostic.
 
-This tool only collects trusted normalized market data and delegates all
-interpretation to :func:`analysis.order_flow_analysis.analyze_order_flow`.
+The production runtime owns collection and analysis; this module only formats
+its structured output for a terminal.
 """
 
 import argparse
 import asyncio
 import sys
-from collections import deque
-from contextlib import suppress
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +22,7 @@ from config import (  # noqa: E402
     LIVE_RECONNECT_MAX_DELAY,
 )
 from exchanges.live import BybitWebSocketProvider, LiveMarketDataService  # noqa: E402
-from orderflow import OrderBookSnapshot, Trade  # noqa: E402
+from runtime.live_order_flow import LiveOrderFlowService  # noqa: E402
 
 
 def _freeze(value):
@@ -76,7 +74,11 @@ def format_anomaly(anomaly):
 
 
 class LiveOrderFlowRunner:
-    """Maintain bounded, generation-isolated inputs for the analysis engine."""
+    """Compatibility formatter around :class:`LiveOrderFlowService`.
+
+    New application code should use ``LiveOrderFlowService`` directly. This
+    adapter keeps the historical diagnostic helpers without owning data rules.
+    """
 
     def __init__(
         self,
@@ -97,87 +99,45 @@ class LiveOrderFlowRunner:
         self.provider = provider
         self.symbol = symbol.upper()
         self.analysis_interval = analysis_interval
-        self.trade_window = trade_window
-        self.snapshots = deque(maxlen=snapshot_history)
-        self.trades = deque(maxlen=max_trades)
-        self.analyzer = analyzer
         self.output = output
-        self.generation = None
         self.analysis_count = 0
+        self.runtime = LiveOrderFlowService(
+            (self.symbol,), provider=provider, market_data_service=_PassiveMarketDataService(provider),
+            analysis_interval=analysis_interval, trade_window=trade_window,
+            snapshot_history=snapshot_history, max_trades=max_trades, analyzer=analyzer,
+        )
+
+    @property
+    def analyzer(self):
+        return self.runtime.analyzer
+
+    @property
+    def generation(self):
+        return self.runtime._states[self.symbol].generation
+
+    @property
+    def snapshots(self):
+        state = self.runtime._states[self.symbol]
+        return _LegacyHistory(state, "snapshots")
+
+    @property
+    def trades(self):
+        state = self.runtime._states[self.symbol]
+        return _LegacyHistory(state, "trades")
 
     def _health(self):
         return self.provider.health.symbols.get(self.symbol)
 
-    def _reset_if_untrusted_or_changed(self):
-        health = self._health()
-        trusted = bool(self.provider.health.connected and health and health.synchronized)
-        current_generation = health.generation if health else None
-        if not trusted:
-            self.snapshots.clear()
-            self.trades.clear()
-            self.generation = None
-            return False
-        if self.generation != current_generation:
-            self.snapshots.clear()
-            self.trades.clear()
-            self.generation = current_generation
-        return True
-
     def record(self, event):
-        """Record an event only while its symbol generation is trusted."""
-        if not self._reset_if_untrusted_or_changed():
-            return False
-        if event.symbol != self.symbol:
-            return False
-        # Re-read after accepting the event so a concurrent resync cannot tag it
-        # with an obsolete generation.
-        health = self._health()
-        if not health or not health.synchronized or health.generation != self.generation:
-            self._reset_if_untrusted_or_changed()
-            return False
-        if isinstance(event, OrderBookSnapshot):
-            if self.snapshots and (
-                event.timestamp <= self.snapshots[-1][1].timestamp
-                or (
-                    event.sequence is not None
-                    and self.snapshots[-1][1].sequence is not None
-                    and event.sequence <= self.snapshots[-1][1].sequence
-                )
-            ):
-                return False
-            self.snapshots.append((self.generation, event))
-            return True
-        if isinstance(event, Trade):
-            self.trades.append((self.generation, event))
-            self._prune_trades(event.timestamp)
-            return True
-        return False
-
-    def _prune_trades(self, reference_time):
-        cutoff = reference_time.timestamp() - self.trade_window
-        while self.trades and self.trades[0][1].timestamp.timestamp() < cutoff:
-            self.trades.popleft()
+        return self.runtime.record_event(event)
 
     def analyze(self):
         """Analyze the latest trusted state, or return ``None`` while waiting."""
-        if not self._reset_if_untrusted_or_changed() or not self.snapshots:
+        latest = self.runtime.analyze_symbol(self.symbol)
+        if latest is None:
             return None
-        health = self._health()
-        generation = self.generation
-        current = self.snapshots[-1][1]
-        self._prune_trades(current.timestamp)
-        history = [item for item_generation, item in list(self.snapshots)[:-1] if item_generation == generation]
-        trades = sorted(
-            (item for item_generation, item in self.trades if item_generation == generation and item.timestamp <= current.timestamp),
-            key=lambda item: item.timestamp,
-        )
-        # Final trust check immediately before handing data to the engine.
-        if not (self.provider.health.connected and health.synchronized and health.generation == generation):
-            self._reset_if_untrusted_or_changed()
-            return None
-        result = self.analyzer(current, trades, history)
         self.analysis_count += 1
-        return result
+        return latest.analysis
 
     async def consume(self):
         async for event in self.provider.events():
@@ -228,6 +188,41 @@ class LiveOrderFlowRunner:
         )
 
 
+class _PassiveMarketDataService:
+    """No-op lifecycle used only by the legacy formatter adapter."""
+
+    def __init__(self, provider):
+        self.provider = provider
+
+    async def start(self):
+        return None
+
+    async def stop(self):
+        return None
+
+
+class _LegacyHistory:
+    """Tuple-tagged view retained for callers of the old diagnostic class."""
+
+    def __init__(self, state, attribute):
+        self._state = state
+        self._items = getattr(state, attribute)
+
+    def __iter__(self):
+        return iter([(self._state.generation, item) for item in self._items])
+
+    def __len__(self):
+        return len(self._items)
+
+    def __bool__(self):
+        return bool(self._items)
+
+    def appendleft(self, tagged_item):
+        generation, item = tagged_item
+        if generation == self._state.generation:
+            self._items.appendleft(item)
+
+
 async def run_live_order_flow(
     *, symbol, duration, analysis_interval, trade_window, snapshot_history,
     max_trades, url=BYBIT_WS_URL, provider=None, service=None, output=print,
@@ -240,37 +235,26 @@ async def run_live_order_flow(
         initial_delay=LIVE_RECONNECT_INITIAL_DELAY,
         max_delay=LIVE_RECONNECT_MAX_DELAY,
     )
-    runner = LiveOrderFlowRunner(
-        provider, symbol, analysis_interval=analysis_interval,
-        trade_window=trade_window, snapshot_history=snapshot_history,
-        max_trades=max_trades, output=output,
+    runtime = LiveOrderFlowService(
+        (symbol,), provider=provider, market_data_service=service,
+        analysis_interval=analysis_interval, trade_window=trade_window,
+        snapshot_history=snapshot_history, max_trades=max_trades,
     )
-    await provider.subscribe_order_book(runner.symbol)
-    await provider.subscribe_trades(runner.symbol)
-    output(f"WAITING: {runner.symbol} trusted order-book snapshot")
-    stop_event = asyncio.Event()
-    tasks = [
-        asyncio.create_task(service.start(), name="order-flow-service"),
-        asyncio.create_task(runner.consume(), name="order-flow-consumer"),
-        asyncio.create_task(runner.analysis_loop(stop_event), name="order-flow-analysis"),
-    ]
+    output(f"WAITING: {symbol.upper()} trusted order-book snapshot")
+    await runtime.start()
+    last_calculated_at = None
+    formatter = LiveOrderFlowRunner(provider, symbol, output=output)
     try:
-        if duration is None:
-            await tasks[0]
-        else:
-            await asyncio.sleep(duration)
+        started = asyncio.get_running_loop().time()
+        while duration is None or asyncio.get_running_loop().time() - started < duration:
+            await asyncio.sleep(min(0.1, analysis_interval))
+            latest = runtime.get_latest(symbol)
+            if latest is not None and latest.calculated_at != last_calculated_at:
+                last_calculated_at = latest.calculated_at
+                formatter.print_summary(latest.analysis)
     finally:
-        stop_event.set()
-        await service.stop()
-        for task in tasks[1:]:
-            task.cancel()
-        await asyncio.gather(*tasks[1:], return_exceptions=True)
-        with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(tasks[0], timeout=5.0)
-        if not tasks[0].done():
-            tasks[0].cancel()
-            await asyncio.gather(tasks[0], return_exceptions=True)
-    return runner
+        await runtime.stop()
+    return runtime
 
 
 def parse_args(argv=None):
