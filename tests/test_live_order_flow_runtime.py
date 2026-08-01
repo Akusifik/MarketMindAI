@@ -258,11 +258,15 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_generation_change_during_analysis_discards_result(self):
         entered, release = threading.Event(), threading.Event()
+        calls = 0
 
         def analyzer(*_):
-            entered.set()
-            release.wait(.5)
-            return {"stale": True}
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                release.wait(.5)
+            return {"cycle": calls}
 
         service, provider, _ = self.make_service(analyzer=analyzer, analysis_interval=.01)
         self.trust(provider, "BTCUSDT", 1)
@@ -273,7 +277,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         service.record_event(snapshot("BTCUSDT", 2))
         release.set()
         await asyncio.sleep(.02)
-        self.assertIsNone(service.get_latest("BTCUSDT"))
+        latest = service.get_latest("BTCUSDT")
+        self.assertTrue(
+            latest is None or (latest.generation == 2 and latest.analysis["cycle"] >= 2)
+        )
         await service.stop()
 
     async def test_sync_loss_during_analysis_discards_result(self):
